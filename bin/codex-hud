@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# codex-mini-hud managed launcher
+
+set -euo pipefail
+
+PACKAGE_ROOT="${CODEX_HUD_PACKAGE_ROOT:-$HOME/.local/share/codex-mini-hud/current}"
+CODEX_BIN="$PACKAGE_ROOT/bin/codex"
+STATE_DIR="${CODEX_HUD_ACTIVITY_DIR:-$HOME/.local/state/codex-mini-hud}"
+
+[[ -x "$CODEX_BIN" ]] || {
+  printf 'codex-hud: patched Codex package is missing: %s\n' "$CODEX_BIN" >&2
+  printf 'Run codex-mini-hud install first.\n' >&2
+  exit 1
+}
+
+today="$(date +%Y-%m-%d)"
+mkdir -p "$STATE_DIR"
+activity="$STATE_DIR/activity"
+streak=1
+lock="$STATE_DIR/activity.lock"
+if mkdir "$lock" 2>/dev/null; then
+  cleanup_lock() {
+    rmdir "$lock" 2>/dev/null || true
+  }
+  trap cleanup_lock EXIT
+  if [[ -r "$activity" ]]; then
+    IFS=' ' read -r previous_day previous_streak < "$activity" || true
+    if [[ "$previous_day" == "$today" && "$previous_streak" =~ ^[0-9]+$ ]]; then
+      streak="$previous_streak"
+    elif [[ "$previous_streak" =~ ^[0-9]+$ ]]; then
+      yesterday="$(date -v-1d +%Y-%m-%d)"
+      if [[ "$previous_day" == "$yesterday" ]]; then
+        streak=$((previous_streak + 1))
+      fi
+    fi
+  fi
+
+  activity_tmp="$(mktemp "$STATE_DIR/.activity.XXXXXX")"
+  printf '%s %s\n' "$today" "$streak" > "$activity_tmp"
+  mv "$activity_tmp" "$activity"
+  cleanup_lock
+  trap - EXIT
+elif [[ -r "$activity" ]]; then
+  IFS=' ' read -r _ cached_streak < "$activity" || true
+  [[ "$cached_streak" =~ ^[0-9]+$ ]] && streak="$cached_streak"
+fi
+
+export CODEX_MINI_HUD=1
+export CODEX_MINI_HUD_STARTED_AT="$(date +%s)"
+export CODEX_MINI_HUD_STREAK="$streak"
+exec "$CODEX_BIN" "$@"

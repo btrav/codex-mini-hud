@@ -1,0 +1,1070 @@
+diff --git a/codex-rs/tui/src/app/background_requests.rs b/codex-rs/tui/src/app/background_requests.rs
+index 69f0612f18..dca2b4d51a 100644
+--- a/codex-rs/tui/src/app/background_requests.rs
++++ b/codex-rs/tui/src/app/background_requests.rs
+@@ -124,6 +124,21 @@ impl App {
+         });
+     }
+ 
++    pub(super) fn refresh_mini_hud_usage(&mut self, app_server: &AppServerSession) {
++        let request_handle = app_server.request_handle();
++        let app_event_tx = self.app_event_tx.clone();
++        tokio::spawn(async move {
++            let result = tokio::time::timeout(
++                TOKEN_ACTIVITY_FETCH_TIMEOUT,
++                fetch_account_token_activity(request_handle),
++            )
++            .await
++            .map_err(|_| "account/usage/read timed out for Codex Mini HUD".to_string())
++            .and_then(|result| result.map_err(|err| err.to_string()));
++            app_event_tx.send(AppEvent::MiniHudUsageLoaded { result });
++        });
++    }
++
+     pub(super) fn consume_rate_limit_reset_credit(
+         &mut self,
+         app_server: &AppServerSession,
+diff --git a/codex-rs/tui/src/app/event_dispatch.rs b/codex-rs/tui/src/app/event_dispatch.rs
+index b8b1bce2b4..5081901e9b 100644
+--- a/codex-rs/tui/src/app/event_dispatch.rs
++++ b/codex-rs/tui/src/app/event_dispatch.rs
+@@ -847,6 +847,18 @@ impl App {
+             AppEvent::RefreshTokenActivity { request_id } => {
+                 self.refresh_token_activity(app_server, request_id);
+             }
++            AppEvent::RefreshMiniHudUsage => {
++                self.refresh_mini_hud_usage(app_server);
++            }
++            AppEvent::MiniHudUsageLoaded { result } => {
++                if let Ok(response) = result {
++                    self.chat_widget
++                        .mini_hud_set_account_streak(response.summary.current_streak_days);
++                }
++            }
++            AppEvent::MiniHudTick { widget_origin } => {
++                self.chat_widget.mini_hud_tick(widget_origin);
++            }
+             AppEvent::RefreshStatusLineWorkspaceHeadline { request_id } => {
+                 self.refresh_status_line_workspace_headline(app_server, request_id);
+             }
+diff --git a/codex-rs/tui/src/app/session_lifecycle.rs b/codex-rs/tui/src/app/session_lifecycle.rs
+index f31c63c96b..1fdfdd2dbc 100644
+--- a/codex-rs/tui/src/app/session_lifecycle.rs
++++ b/codex-rs/tui/src/app/session_lifecycle.rs
+@@ -396,6 +396,7 @@ impl App {
+         if chat_widget.last_terminal_title.is_none() {
+             chat_widget.last_terminal_title = previous_terminal_title;
+         }
++        chat_widget.mini_hud_inherit_process_state(&self.chat_widget);
+         chat_widget.remote_connection = self.chat_widget.remote_connection.clone();
+         for (thread_id, entry) in self.agent_navigation.ordered_threads() {
+             chat_widget.set_collab_agent_metadata(
+diff --git a/codex-rs/tui/src/app_event.rs b/codex-rs/tui/src/app_event.rs
+index 4f731958c3..254e1dab52 100644
+--- a/codex-rs/tui/src/app_event.rs
++++ b/codex-rs/tui/src/app_event.rs
+@@ -408,6 +408,19 @@ pub(crate) enum AppEvent {
+         result: Result<GetAccountTokenUsageResponse, String>,
+     },
+ 
++    /// Fetch the signed-in account streak for the optional Codex Mini HUD.
++    RefreshMiniHudUsage,
++
++    /// Result of the Codex Mini HUD account streak fetch.
++    MiniHudUsageLoaded {
++        result: Result<GetAccountTokenUsageResponse, String>,
++    },
++
++    /// Refresh time-dependent Codex Mini HUD fields.
++    MiniHudTick {
++        widget_origin: std::time::Instant,
++    },
++
+     /// Fetch workspace messages for the status-line headline item.
+     RefreshStatusLineWorkspaceHeadline {
+         request_id: u64,
+diff --git a/codex-rs/tui/src/chatwidget.rs b/codex-rs/tui/src/chatwidget.rs
+index a3d539e54c..73eb7604bc 100644
+--- a/codex-rs/tui/src/chatwidget.rs
++++ b/codex-rs/tui/src/chatwidget.rs
+@@ -448,6 +448,7 @@ use self::user_messages::remap_placeholders_for_message;
+ use self::user_messages::user_message_display_for_history;
+ use self::user_messages::user_message_for_restore;
+ use self::user_messages::user_message_preview_text;
++mod mini_hud;
+ mod warnings;
+ use self::warnings::WarningDisplayState;
+ pub(crate) use crate::branch_summary::StatusLineGitSummary;
+@@ -723,6 +724,16 @@ pub(crate) struct ChatWidget {
+     terminal_title_setup_original_items: Option<Option<Vec<String>>>,
+     // Baseline instant used to animate spinner-prefixed title statuses.
+     terminal_title_animation_origin: Instant,
++    // Codex Mini HUD session metrics. These are derived from live protocol events only.
++    mini_hud_enabled: bool,
++    mini_hud_tick_scheduled: std::cell::Cell<bool>,
++    mini_hud_widget_origin: Instant,
++    mini_hud_started_at: Instant,
++    mini_hud_lines_added: u64,
++    mini_hud_lines_removed: u64,
++    mini_hud_pending_diff: (u64, u64),
++    mini_hud_compactions: u64,
++    mini_hud_streak_days: Option<i64>,
+     // Cached project-root display name keyed by cwd for status/title rendering.
+     status_line_project_root_name_cache: Option<CachedProjectRootName>,
+     // Cached git branch name for the status line (None if unknown).
+@@ -1625,6 +1636,9 @@ impl ChatWidget {
+     pub(crate) fn on_terminal_resize(&mut self, width: u16) {
+         let had_rendered_width = self.last_rendered_width.get().is_some();
+         self.last_rendered_width.set(Some(width as usize));
++        if self.mini_hud_enabled {
++            self.refresh_status_line();
++        }
+         let stream_width = self.current_stream_width(/*reserved_cols*/ 2);
+         let plan_stream_width = self.current_stream_width(/*reserved_cols*/ 4);
+         if let Some(controller) = self.stream_controller.as_mut() {
+diff --git a/codex-rs/tui/src/chatwidget/constructor.rs b/codex-rs/tui/src/chatwidget/constructor.rs
+index eb979ceff1..d6ec3fb30d 100644
+--- a/codex-rs/tui/src/chatwidget/constructor.rs
++++ b/codex-rs/tui/src/chatwidget/constructor.rs
+@@ -227,6 +227,17 @@ impl ChatWidget {
+             last_terminal_title_requires_action: false,
+             terminal_title_setup_original_items: None,
+             terminal_title_animation_origin: Instant::now(),
++            mini_hud_enabled: std::env::var_os("CODEX_MINI_HUD").is_some(),
++            mini_hud_tick_scheduled: std::cell::Cell::new(false),
++            mini_hud_widget_origin: Instant::now(),
++            mini_hud_started_at: super::mini_hud::mini_hud_process_origin(),
++            mini_hud_lines_added: 0,
++            mini_hud_lines_removed: 0,
++            mini_hud_pending_diff: (0, 0),
++            mini_hud_compactions: 0,
++            mini_hud_streak_days: std::env::var("CODEX_MINI_HUD_STREAK")
++                .ok()
++                .and_then(|value| value.parse().ok()),
+             status_line_project_root_name_cache: None,
+             status_line_branch: None,
+             status_line_branch_cwd: None,
+@@ -255,9 +266,9 @@ impl ChatWidget {
+         widget
+             .bottom_pane
+             .set_vim_enabled(widget.config.tui_vim_mode_default);
+-        widget
+-            .bottom_pane
+-            .set_status_line_enabled(!widget.configured_status_line_items().is_empty());
++        widget.bottom_pane.set_status_line_enabled(
++            widget.mini_hud_enabled || !widget.configured_status_line_items().is_empty(),
++        );
+         widget
+             .bottom_pane
+             .set_collaboration_modes_enabled(/*enabled*/ true);
+@@ -285,6 +296,9 @@ impl ChatWidget {
+             .bottom_pane
+             .set_token_activity_command_enabled(widget.has_codex_backend_auth);
+         widget.refresh_status_surfaces();
++        if widget.mini_hud_enabled && widget.has_codex_backend_auth {
++            widget.app_event_tx.send(AppEvent::RefreshMiniHudUsage);
++        }
+ 
+         widget
+     }
+diff --git a/codex-rs/tui/src/chatwidget/mini_hud.rs b/codex-rs/tui/src/chatwidget/mini_hud.rs
+new file mode 100644
+index 0000000000..485aaad290
+--- /dev/null
++++ b/codex-rs/tui/src/chatwidget/mini_hud.rs
+@@ -0,0 +1,743 @@
++use super::*;
++use codex_protocol::config_types::ServiceTier;
++use ratatui::prelude::Stylize;
++use ratatui::style::Color;
++use ratatui::style::Modifier;
++use ratatui::style::Style;
++use ratatui::text::Line;
++use ratatui::text::Span;
++use unicode_width::UnicodeWidthStr;
++
++const SEPARATOR: &str = " · ";
++const CONTEXT_CELLS: usize = 10;
++const LIMIT_CELLS: usize = 5;
++
++pub(super) fn mini_hud_process_origin() -> Instant {
++    let elapsed = std::env::var("CODEX_MINI_HUD_STARTED_AT")
++        .ok()
++        .and_then(|value| value.parse::<u64>().ok())
++        .and_then(|started_at| {
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .ok()
++                .map(|now| now.as_secs().saturating_sub(started_at))
++        })
++        .map(Duration::from_secs)
++        .unwrap_or_default();
++    Instant::now()
++        .checked_sub(elapsed)
++        .unwrap_or_else(Instant::now)
++}
++
++#[derive(Clone, Copy)]
++enum Tone {
++    Brand,
++    Good,
++    Warn,
++    Danger,
++    Info,
++    Positive,
++    Muted,
++}
++
++struct HudField {
++    segments: Vec<HudSegment>,
++    drop_rank: u8,
++    separator: &'static str,
++}
++
++struct HudSegment {
++    text: String,
++    tone: Tone,
++}
++
++impl HudField {
++    fn new(text: impl Into<String>, tone: Tone, drop_rank: u8) -> Self {
++        Self {
++            segments: vec![HudSegment {
++                text: text.into(),
++                tone,
++            }],
++            drop_rank,
++            separator: SEPARATOR,
++        }
++    }
++
++    fn attached(text: impl Into<String>, tone: Tone, drop_rank: u8) -> Self {
++        Self {
++            segments: vec![HudSegment {
++                text: text.into(),
++                tone,
++            }],
++            drop_rank,
++            separator: " ",
++        }
++    }
++
++    fn segmented(segments: Vec<HudSegment>, drop_rank: u8) -> Self {
++        Self {
++            segments,
++            drop_rank,
++            separator: SEPARATOR,
++        }
++    }
++
++    fn attached_segmented(segments: Vec<HudSegment>, drop_rank: u8) -> Self {
++        Self {
++            segments,
++            drop_rank,
++            separator: " ",
++        }
++    }
++
++    fn text(&self) -> String {
++        self.segments
++            .iter()
++            .map(|segment| segment.text.as_str())
++            .collect()
++    }
++}
++
++impl ChatWidget {
++    pub(super) fn mini_hud_line(&self) -> Line<'static> {
++        let use_colors = self.config.tui_status_line_use_colors
++            && std::env::var_os("NO_COLOR").is_none()
++            && std::env::var("TERM").ok().as_deref() != Some("dumb");
++        let width = self
++            .last_rendered_width
++            .get()
++            .unwrap_or(120)
++            .saturating_sub(2);
++        let medium = width < 92;
++        let narrow = width < 75;
++        let minimal = width < 45;
++        let full_access = mini_hud_full_access(&self.config);
++        let credits_alert = self.codex_spend_control_reached == Some(true)
++            || matches!(
++                self.codex_rate_limit_reached_type,
++                Some(
++                    RateLimitReachedType::WorkspaceOwnerCreditsDepleted
++                        | RateLimitReachedType::WorkspaceMemberCreditsDepleted
++                        | RateLimitReachedType::WorkspaceOwnerUsageLimitReached
++                        | RateLimitReachedType::WorkspaceMemberUsageLimitReached
++                )
++            );
++        let mut fields = Vec::new();
++
++        fields.push(HudField::new("✦Codex✦", Tone::Brand, 0));
++
++        if full_access {
++            fields.push(HudField::attached(
++                if minimal { "!full!" } else { "!full access!" },
++                Tone::Danger,
++                0,
++            ));
++        }
++
++        match self.status_line_context_used_percent() {
++            Some(used) if minimal => fields.push(HudField::attached(
++                format!("{used}%"),
++                threshold_tone(used),
++                0,
++            )),
++            Some(used) => fields.push(HudField::attached_segmented(
++                context_segments(used, if narrow { 5 } else { CONTEXT_CELLS }),
++                0,
++            )),
++            None => fields.push(HudField::attached("ctx ?", Tone::Muted, 0)),
++        }
++
++        if let Some(window) = self
++            .rate_limit_snapshots_by_limit_id
++            .get("codex")
++            .and_then(|snapshot| snapshot.primary.as_ref())
++        {
++            let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0).round() as i64;
++            let reset = (remaining <= 24)
++                .then(|| window.resets_at_epoch.and_then(reset_eta))
++                .flatten();
++            let text = match (reset, medium) {
++                (_, true) => limit_battery(remaining),
++                (Some(reset), false) => format!("{} {reset}", limit_battery(remaining)),
++                (None, false) => limit_battery(remaining),
++            };
++            fields.push(HudField::new(text, remaining_tone(remaining), 0));
++        } else {
++            fields.push(HudField::new("limit ?", Tone::Muted, 0));
++        }
++
++        if credits_alert {
++            fields.push(HudField::attached("!credits!", Tone::Danger, 0));
++        }
++
++        if self.current_service_tier() == Some(ServiceTier::Fast.request_value()) {
++            fields.push(HudField::new("fast", Tone::Warn, 3));
++        }
++
++        if !narrow {
++            fields.push(HudField::new(
++                if medium {
++                    format_duration_compact(self.mini_hud_started_at.elapsed())
++                } else {
++                    format_duration(self.mini_hud_started_at.elapsed())
++                },
++                Tone::Muted,
++                4,
++            ));
++        }
++
++        let lines_added = self
++            .mini_hud_lines_added
++            .saturating_add(self.mini_hud_pending_diff.0);
++        let lines_removed = self
++            .mini_hud_lines_removed
++            .saturating_add(self.mini_hud_pending_diff.1);
++        if !narrow && (lines_added > 0 || lines_removed > 0) {
++            let (added, removed) = if medium {
++                (format_count(lines_added), format_count(lines_removed))
++            } else {
++                (lines_added.to_string(), lines_removed.to_string())
++            };
++            fields.push(HudField::segmented(
++                vec![
++                    HudSegment {
++                        text: format!("+{added}"),
++                        tone: Tone::Positive,
++                    },
++                    HudSegment {
++                        text: format!(" -{removed}"),
++                        tone: Tone::Danger,
++                    },
++                ],
++                5,
++            ));
++        }
++
++        if !medium && let Some(streak) = self.mini_hud_streak_days.filter(|days| *days > 1) {
++            fields.push(HudField::new(format!("♨{streak}d"), Tone::Warn, 7));
++        }
++
++        if !narrow && self.mini_hud_compactions > 0 {
++            fields.push(HudField::new(
++                format!("⟳{}", self.mini_hud_compactions),
++                Tone::Info,
++                6,
++            ));
++        }
++
++        let model = compact_model_name(self.model_display_name());
++        let effort = self.reasoning_display_name();
++        if medium {
++            fields.push(HudField::new(format!("{model}/{effort}"), Tone::Muted, 1));
++        } else {
++            fields.push(HudField::new(model, Tone::Muted, 1));
++            fields.push(HudField::new(effort, Tone::Muted, 2));
++        }
++
++        fit_fields(&mut fields, width);
++        bound_fields(&mut fields, width);
++        self.schedule_mini_hud_tick();
++        render_fields(fields, use_colors)
++    }
++
++    fn schedule_mini_hud_tick(&self) {
++        if self.mini_hud_tick_scheduled.replace(true) {
++            return;
++        }
++        let tx = self.app_event_tx.clone();
++        let widget_origin = self.mini_hud_widget_origin;
++        tokio::spawn(async move {
++            tokio::time::sleep(Duration::from_secs(60)).await;
++            tx.send(AppEvent::MiniHudTick { widget_origin });
++        });
++    }
++
++    pub(crate) fn mini_hud_tick(&mut self, widget_origin: Instant) {
++        if self.mini_hud_widget_origin != widget_origin {
++            return;
++        }
++        self.mini_hud_tick_scheduled.set(false);
++        if self.mini_hud_enabled {
++            self.refresh_status_line();
++        }
++    }
++
++    pub(crate) fn mini_hud_set_account_streak(&mut self, streak: Option<i64>) {
++        if let Some(streak) = streak.filter(|days| *days >= 0) {
++            self.mini_hud_streak_days = Some(streak);
++        }
++        self.refresh_status_line();
++    }
++
++    pub(crate) fn mini_hud_inherit_process_state(&mut self, previous: &Self) {
++        // Only completed turns belong to the process total. The pending diff is
++        // cumulative for the previous thread's active turn and may grow while
++        // that thread is inactive; folding it in here would double-count it
++        // when replay later supplies the thread's newer cumulative diff.
++        self.mini_hud_lines_added = previous.mini_hud_lines_added;
++        self.mini_hud_lines_removed = previous.mini_hud_lines_removed;
++        self.mini_hud_pending_diff = (0, 0);
++        // Compactions belong to the destination thread. Replay will repopulate
++        // this count from that thread's ContextCompaction items.
++        self.mini_hud_compactions = 0;
++        self.mini_hud_streak_days = previous.mini_hud_streak_days;
++        if self.mini_hud_enabled {
++            self.refresh_status_line();
++        }
++    }
++
++    pub(super) fn mini_hud_note_compaction(&mut self) {
++        self.mini_hud_compactions = self.mini_hud_compactions.saturating_add(1);
++        self.refresh_status_line();
++    }
++
++    pub(super) fn mini_hud_update_turn_diff(&mut self, unified_diff: &str) {
++        self.mini_hud_pending_diff = diff_line_counts(unified_diff);
++        self.refresh_status_line();
++    }
++
++    pub(super) fn mini_hud_finish_turn(&mut self) {
++        self.mini_hud_lines_added = self
++            .mini_hud_lines_added
++            .saturating_add(self.mini_hud_pending_diff.0);
++        self.mini_hud_lines_removed = self
++            .mini_hud_lines_removed
++            .saturating_add(self.mini_hud_pending_diff.1);
++        self.mini_hud_pending_diff = (0, 0);
++        self.refresh_status_line();
++    }
++}
++
++fn render_fields(fields: Vec<HudField>, use_colors: bool) -> Line<'static> {
++    let mut spans = Vec::new();
++    for field in fields {
++        if !spans.is_empty() {
++            spans.push(if use_colors {
++                field.separator.dim()
++            } else {
++                Span::raw(field.separator)
++            });
++        }
++        for segment in field.segments {
++            spans.push(Span::styled(
++                segment.text,
++                tone_style(segment.tone, use_colors),
++            ));
++        }
++    }
++    Line::from(spans)
++}
++
++fn tone_style(tone: Tone, use_colors: bool) -> Style {
++    if !use_colors {
++        return Style::default();
++    }
++    let color = match tone {
++        Tone::Brand => Color::LightMagenta,
++        Tone::Good | Tone::Positive => Color::LightGreen,
++        Tone::Warn => Color::LightYellow,
++        Tone::Danger => Color::LightRed,
++        Tone::Info => Color::LightCyan,
++        Tone::Muted => Color::Gray,
++    };
++    let mut style = Style::default().fg(color);
++    if matches!(tone, Tone::Brand | Tone::Danger) {
++        style = style.add_modifier(Modifier::BOLD);
++    }
++    style
++}
++
++fn fit_fields(fields: &mut Vec<HudField>, width: usize) {
++    while fields_width(fields) > width {
++        let Some((index, _)) = fields
++            .iter()
++            .enumerate()
++            .filter(|(_, field)| field.drop_rank > 0)
++            .max_by_key(|(_, field)| field.drop_rank)
++        else {
++            break;
++        };
++        fields.remove(index);
++    }
++}
++
++fn bound_fields(fields: &mut Vec<HudField>, width: usize) {
++    if fields_width(fields) <= width {
++        return;
++    }
++
++    let brand = fields
++        .first()
++        .map(HudField::text)
++        .unwrap_or_else(|| "✦Codex✦".to_string());
++    let alerts = fields
++        .iter()
++        .filter(|field| {
++            field.segments.iter().any(|segment| {
++                matches!(segment.tone, Tone::Danger) && segment.text.starts_with('!')
++            })
++        })
++        .map(|field| field.text())
++        .collect::<Vec<_>>();
++    let context = fields
++        .iter()
++        .find(|field| {
++            let text = field.text();
++            text.contains('%') || text.starts_with("ctx ")
++        })
++        .map(HudField::text);
++    let limit = fields
++        .iter()
++        .find(|field| field.text().contains('▮') || field.text().contains('▯'))
++        .map(HudField::text);
++
++    fields.clear();
++    fields.push(HudField::new(brand, Tone::Brand, 0));
++    for alert in alerts {
++        let short = if alert.contains("full") {
++            "!full!"
++        } else {
++            "!credits!"
++        };
++        fields.push(HudField::attached(short, Tone::Danger, 0));
++    }
++    if fields_width(fields) < width {
++        if let Some(context) = context {
++            let percent = context
++                .split_whitespace()
++                .last()
++                .unwrap_or(context.as_str())
++                .to_string();
++            fields.push(HudField::new(percent, Tone::Muted, 1));
++        }
++        if let Some(limit) = limit {
++            fields.push(HudField::new(limit, Tone::Muted, 2));
++        }
++        fit_fields(fields, width);
++    }
++
++    while fields_width(fields) > width && fields.len() > 1 {
++        fields.pop();
++    }
++    if fields_width(fields) > width {
++        let text = fields[0].text();
++        let bounded = text.chars().take(width).collect::<String>();
++        fields[0] = HudField::new(bounded, Tone::Brand, 0);
++    }
++}
++
++fn fields_width(fields: &[HudField]) -> usize {
++    fields
++        .iter()
++        .map(|field| UnicodeWidthStr::width(field.text().as_str()))
++        .sum::<usize>()
++        + fields
++            .iter()
++            .skip(1)
++            .map(|field| UnicodeWidthStr::width(field.separator))
++            .sum::<usize>()
++}
++
++#[cfg(test)]
++fn context_bar(used: i64) -> String {
++    context_bar_cells(used, CONTEXT_CELLS)
++}
++
++#[cfg(test)]
++fn context_bar_cells(used: i64, cells: usize) -> String {
++    let used = used.clamp(0, 100);
++    let filled = if used == 100 {
++        cells
++    } else {
++        (used * cells as i64 / 100) as usize
++    };
++    format!(
++        "{}{} {used:>3}%",
++        "▓".repeat(filled),
++        "░".repeat(cells - filled)
++    )
++}
++
++fn context_segments(used: i64, cells: usize) -> Vec<HudSegment> {
++    let used = used.clamp(0, 100);
++    let filled = if used == 100 {
++        cells
++    } else {
++        (used * cells as i64 / 100) as usize
++    };
++    let mut segments = (0..cells)
++        .map(|index| HudSegment {
++            text: if index < filled { "▓" } else { "░" }.to_string(),
++            tone: if index >= filled {
++                Tone::Muted
++            } else if index * 10 >= cells * 8 {
++                Tone::Danger
++            } else if index * 10 >= cells * 6 {
++                Tone::Warn
++            } else {
++                Tone::Good
++            },
++        })
++        .collect::<Vec<_>>();
++    segments.push(HudSegment {
++        text: format!(" {used:>3}%"),
++        tone: threshold_tone(used),
++    });
++    segments
++}
++
++fn limit_battery(remaining: i64) -> String {
++    let cells = match remaining {
++        85..=100 => 5,
++        65..=84 => 4,
++        45..=64 => 3,
++        25..=44 => 2,
++        11..=24 => 1,
++        _ => 0,
++    };
++    format!("{}{}", "▮".repeat(cells), "▯".repeat(LIMIT_CELLS - cells))
++}
++
++fn threshold_tone(used: i64) -> Tone {
++    match used {
++        90.. => Tone::Danger,
++        70.. => Tone::Warn,
++        _ => Tone::Good,
++    }
++}
++
++fn remaining_tone(remaining: i64) -> Tone {
++    match remaining {
++        0..=10 => Tone::Danger,
++        11..=24 => Tone::Warn,
++        _ => Tone::Good,
++    }
++}
++
++fn reset_eta(epoch: i64) -> Option<String> {
++    let now = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .ok()?
++        .as_secs() as i64;
++    let seconds = epoch.saturating_sub(now);
++    if seconds <= 0 {
++        return Some("soon".to_string());
++    }
++    if seconds < 60 {
++        return Some("<1m".to_string());
++    }
++    let minutes = (seconds + 59) / 60;
++    if minutes < 60 {
++        Some(format!("~{minutes}m"))
++    } else {
++        Some(format!("~{}h{:02}m", minutes / 60, minutes % 60))
++    }
++}
++
++fn format_duration(duration: Duration) -> String {
++    let minutes = duration.as_secs() / 60;
++    let hours = minutes / 60;
++    let minutes = minutes % 60;
++    if hours > 0 {
++        format!("{hours}h {minutes}m")
++    } else {
++        format!("{minutes}m")
++    }
++}
++
++fn format_duration_compact(duration: Duration) -> String {
++    let minutes = duration.as_secs() / 60;
++    if minutes >= 60 {
++        format!("{}h", minutes / 60)
++    } else if minutes == 0 {
++        "<1m".to_string()
++    } else {
++        format!("{minutes}m")
++    }
++}
++
++fn format_count(value: u64) -> String {
++    if value < 1_000 {
++        value.to_string()
++    } else if value < 10_000 {
++        let rounded = value as f64 / 1_000.0;
++        format!("{rounded:.1}k").replace(".0k", "k")
++    } else {
++        format!("{}k", value / 1_000)
++    }
++}
++
++fn compact_model_name(model: &str) -> String {
++    let model = model.strip_prefix("openai/").unwrap_or(model);
++    let suffix = if model.ends_with("-sol") {
++        "S"
++    } else if model.ends_with("-terra") {
++        "T"
++    } else if model.ends_with("-luna") {
++        "L"
++    } else {
++        ""
++    };
++    if let Some(version) = model.strip_prefix("gpt-") {
++        let version = version
++            .split_once('-')
++            .map_or(version, |(version, _)| version);
++        return format!("G{version}{suffix}");
++    }
++    if model.is_empty() {
++        "model ?".to_string()
++    } else if UnicodeWidthStr::width(model) <= 8 {
++        model.to_string()
++    } else {
++        format!("{}…", model.chars().take(7).collect::<String>())
++    }
++}
++
++fn diff_line_counts(diff: &str) -> (u64, u64) {
++    diff.lines().fold((0, 0), |(added, removed), line| {
++        if line.starts_with("+++") || line.starts_with("---") {
++            (added, removed)
++        } else if line.starts_with('+') {
++            (added + 1, removed)
++        } else if line.starts_with('-') {
++            (added, removed + 1)
++        } else {
++            (added, removed)
++        }
++    })
++}
++
++fn mini_hud_full_access(config: &Config) -> bool {
++    config.permissions.effective_permission_profile() == PermissionProfile::Disabled
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn context_bar_rounds_up_and_keeps_ten_cells() {
++        assert_eq!(context_bar(53), "▓▓▓▓▓░░░░░  53%");
++        assert_eq!(context_bar(0), "░░░░░░░░░░   0%");
++        assert_eq!(context_bar(100), "▓▓▓▓▓▓▓▓▓▓ 100%");
++    }
++
++    #[test]
++    fn battery_matches_claude_thresholds() {
++        assert_eq!(limit_battery(85), "▮▮▮▮▮");
++        assert_eq!(limit_battery(65), "▮▮▮▮▯");
++        assert_eq!(limit_battery(45), "▮▮▮▯▯");
++        assert_eq!(limit_battery(25), "▮▮▯▯▯");
++        assert_eq!(limit_battery(11), "▮▯▯▯▯");
++        assert_eq!(limit_battery(10), "▯▯▯▯▯");
++    }
++
++    #[test]
++    fn diff_counts_content_not_headers() {
++        assert_eq!(
++            diff_line_counts("--- a/file\n+++ b/file\n@@ -1 +1,2 @@\n-old\n+new\n+more\n"),
++            (2, 1)
++        );
++    }
++
++    #[test]
++    fn responsive_fit_drops_low_value_fields_first() {
++        let mut fields = vec![
++            HudField::new("✦Codex✦", Tone::Brand, 0),
++            HudField::new("█████░░░░░ 50%", Tone::Good, 0),
++            HudField::new("12h 4m", Tone::Muted, 4),
++            HudField::new("♨3d", Tone::Warn, 7),
++            HudField::new("gpt-5.6", Tone::Info, 0),
++        ];
++        fit_fields(&mut fields, 42);
++        assert!(fields.iter().all(|field| field.text() != "♨3d"));
++        assert!(fields.iter().any(|field| field.text() == "gpt-5.6"));
++    }
++
++    #[test]
++    fn no_color_uses_default_style_for_every_span() {
++        let line = render_fields(
++            vec![
++                HudField::new("✦Codex✦", Tone::Brand, 0),
++                HudField::new("▮▮▯▯▯", Tone::Warn, 0),
++            ],
++            false,
++        );
++        assert!(line.spans.iter().all(|span| span.style == Style::default()));
++    }
++
++    #[test]
++    fn diff_additions_and_removals_have_distinct_tones() {
++        let field = HudField::segmented(
++            vec![
++                HudSegment {
++                    text: "+12".to_string(),
++                    tone: Tone::Positive,
++                },
++                HudSegment {
++                    text: " -3".to_string(),
++                    tone: Tone::Danger,
++                },
++            ],
++            5,
++        );
++        let line = render_fields(vec![field], true);
++        assert_eq!(line.spans[0].style.fg, Some(Color::LightGreen));
++        assert_eq!(line.spans[1].style.fg, Some(Color::LightRed));
++    }
++
++    #[test]
++    fn bounded_fallback_never_exceeds_terminal_width() {
++        for width in 0..45 {
++            let mut fields = vec![
++                HudField::new("✦Codex✦", Tone::Brand, 0),
++                HudField::attached("!full access!", Tone::Danger, 0),
++                HudField::attached("!credits!", Tone::Danger, 0),
++                HudField::new("▓▓▓▓▓░░░░░  53%", Tone::Good, 0),
++                HudField::new("▮▮▯▯▯", Tone::Good, 0),
++                HudField::new("G5.6S/high", Tone::Muted, 1),
++            ];
++            fit_fields(&mut fields, width);
++            bound_fields(&mut fields, width);
++            assert!(fields_width(&fields) <= width, "overflow at width {width}");
++        }
++    }
++
++    #[test]
++    fn wide_plain_line_matches_expected_shape() {
++        let line = render_fields(
++            vec![
++                HudField::new("✦Codex✦", Tone::Brand, 0),
++                HudField::attached_segmented(context_segments(53, 10), 0),
++                HudField::new("▮▮▯▯▯", Tone::Good, 0),
++                HudField::new("2h 14m", Tone::Muted, 4),
++                HudField::segmented(
++                    vec![
++                        HudSegment {
++                            text: "+1079".to_string(),
++                            tone: Tone::Positive,
++                        },
++                        HudSegment {
++                            text: " -239".to_string(),
++                            tone: Tone::Danger,
++                        },
++                    ],
++                    5,
++                ),
++                HudField::new("♨7d", Tone::Muted, 7),
++                HudField::new("G5.6S", Tone::Muted, 1),
++                HudField::new("high", Tone::Muted, 2),
++            ],
++            false,
++        );
++        let plain = line
++            .spans
++            .iter()
++            .map(|span| span.content.as_ref())
++            .collect::<String>();
++        assert_eq!(
++            plain,
++            "✦Codex✦ ▓▓▓▓▓░░░░░  53% · ▮▮▯▯▯ · 2h 14m · +1079 -239 · ♨7d · G5.6S · high"
++        );
++    }
++}
+diff --git a/codex-rs/tui/src/chatwidget/protocol.rs b/codex-rs/tui/src/chatwidget/protocol.rs
+index 79e2c3fe6e..40f00a43e9 100644
+--- a/codex-rs/tui/src/chatwidget/protocol.rs
++++ b/codex-rs/tui/src/chatwidget/protocol.rs
+@@ -241,6 +241,9 @@ impl ChatWidget {
+         // this TUI already rendered locally. Once that turn ends, another
+         // client can submit the same text and it still needs its own user cell.
+         self.last_rendered_user_message_display = None;
++        if !matches!(notification.turn.status, TurnStatus::InProgress) {
++            self.mini_hud_finish_turn();
++        }
+         match notification.turn.status {
+             TurnStatus::Completed => {
+                 let last_agent_message =
+diff --git a/codex-rs/tui/src/chatwidget/protocol_requests.rs b/codex-rs/tui/src/chatwidget/protocol_requests.rs
+index c60c368fdb..2e0abecb30 100644
+--- a/codex-rs/tui/src/chatwidget/protocol_requests.rs
++++ b/codex-rs/tui/src/chatwidget/protocol_requests.rs
+@@ -161,7 +161,7 @@ impl ChatWidget {
+ 
+     pub(super) fn on_turn_diff(&mut self, unified_diff: String) {
+         debug!("TurnDiffEvent: {unified_diff}");
+-        self.refresh_status_line();
++        self.mini_hud_update_turn_diff(&unified_diff);
+     }
+ 
+     pub(super) fn on_deprecation_notice(&mut self, summary: String, details: Option<String>) {
+diff --git a/codex-rs/tui/src/chatwidget/replay.rs b/codex-rs/tui/src/chatwidget/replay.rs
+index fad6eb8473..549bd5771f 100644
+--- a/codex-rs/tui/src/chatwidget/replay.rs
++++ b/codex-rs/tui/src/chatwidget/replay.rs
+@@ -187,6 +187,7 @@ impl ChatWidget {
+                 self.exit_review_mode_after_item();
+             }
+             ThreadItem::ContextCompaction { .. } => {
++                self.mini_hud_note_compaction();
+                 self.add_info_message("Context compacted".to_string(), /*hint*/ None);
+             }
+             ThreadItem::HookPrompt { .. } => {}
+diff --git a/codex-rs/tui/src/chatwidget/status_surfaces.rs b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+index 7120462330..edc50fb383 100644
+--- a/codex-rs/tui/src/chatwidget/status_surfaces.rs
++++ b/codex-rs/tui/src/chatwidget/status_surfaces.rs
+@@ -175,7 +175,7 @@ impl ChatWidget {
+     }
+ 
+     fn refresh_status_line_from_selections(&mut self, selections: &StatusSurfaceSelections) {
+-        let enabled = !selections.status_line_items.is_empty();
++        let enabled = self.mini_hud_enabled || !selections.status_line_items.is_empty();
+         self.bottom_pane.set_status_line_enabled(enabled);
+         if !enabled {
+             self.set_status_line(/*status_line*/ None);
+@@ -183,6 +183,12 @@ impl ChatWidget {
+             return;
+         }
+ 
++        if self.mini_hud_enabled {
++            self.set_status_line(Some(self.mini_hud_line()));
++            self.set_status_line_hyperlink(/*url*/ None);
++            return;
++        }
++
+         let mut segments = Vec::new();
+         for item in &selections.status_line_items {
+             if let Some(value) = self.status_line_value_for_item(*item) {
+@@ -865,7 +871,7 @@ impl ChatWidget {
+         }
+     }
+ 
+-    fn reasoning_display_name(&self) -> String {
++    pub(super) fn reasoning_display_name(&self) -> String {
+         let effort = self.effective_reasoning_effort();
+         Self::status_line_reasoning_effort_label(effort.as_ref())
+     }
+@@ -996,7 +1002,7 @@ impl ChatWidget {
+     }
+ }
+ 
+-fn five_hour_status_window(
++pub(super) fn five_hour_status_window(
+     snapshot: &RateLimitSnapshotDisplay,
+ ) -> Option<(&RateLimitWindowDisplay, bool)> {
+     find_primary_codex_window(snapshot, "5h")
+diff --git a/codex-rs/tui/src/status/rate_limits.rs b/codex-rs/tui/src/status/rate_limits.rs
+index aaf54df448..4dbc4d75d0 100644
+--- a/codex-rs/tui/src/status/rate_limits.rs
++++ b/codex-rs/tui/src/status/rate_limits.rs
+@@ -71,6 +71,8 @@ pub(crate) struct RateLimitWindowDisplay {
+     pub used_percent: f64,
+     /// Human-readable local reset time.
+     pub resets_at: Option<String>,
++    /// Unix timestamp used by compact clients that need a live relative countdown.
++    pub resets_at_epoch: Option<i64>,
+     /// Window length in minutes when provided by the server.
+     pub window_minutes: Option<i64>,
+ }
+@@ -86,6 +88,7 @@ impl RateLimitWindowDisplay {
+         Self {
+             used_percent: f64::from(window.used_percent),
+             resets_at,
++            resets_at_epoch: window.resets_at,
+             window_minutes: window.window_duration_mins,
+         }
+     }
+@@ -429,6 +432,7 @@ mod tests {
+         RateLimitWindowDisplay {
+             used_percent,
+             resets_at: Some("soon".to_string()),
++            resets_at_epoch: None,
+             window_minutes: Some(300),
+         }
+     }
+@@ -488,11 +492,13 @@ mod tests {
+             primary: Some(RateLimitWindowDisplay {
+                 used_percent: 20.0,
+                 resets_at: Some("soon".to_string()),
++                resets_at_epoch: None,
+                 window_minutes: Some(60),
+             }),
+             secondary: Some(RateLimitWindowDisplay {
+                 used_percent: 40.0,
+                 resets_at: Some("later".to_string()),
++                resets_at_epoch: None,
+                 window_minutes: Some(2 * 60),
+             }),
+             credits: None,
+diff --git a/codex-rs/tui/src/status/tests.rs b/codex-rs/tui/src/status/tests.rs
+index d95bc217f5..a01da3c264 100644
+--- a/codex-rs/tui/src/status/tests.rs
++++ b/codex-rs/tui/src/status/tests.rs
+@@ -68,6 +68,7 @@ fn stale_monthly_limit_marks_fresh_rolling_snapshot_stale() {
+         primary: Some(RateLimitWindowDisplay {
+             used_percent: 20.0,
+             resets_at: Some("soon".to_string()),
++            resets_at_epoch: None,
+             window_minutes: Some(300),
+         }),
+         secondary: None,
+@@ -1744,11 +1745,13 @@ async fn transcript_overlay_remeasures_status_after_rate_limit_refresh() {
+             primary: Some(RateLimitWindowDisplay {
+                 used_percent: 45.0,
+                 resets_at: Some("soon".to_string()),
++                resets_at_epoch: None,
+                 window_minutes: Some(300),
+             }),
+             secondary: Some(RateLimitWindowDisplay {
+                 used_percent: 30.0,
+                 resets_at: Some("later".to_string()),
++                resets_at_epoch: None,
+                 window_minutes: Some(10_080),
+             }),
+             credits: None,

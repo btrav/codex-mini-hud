@@ -1,0 +1,14 @@
+codex-mini-hud
+Copyright 2026 Benjamin Travis
+
+This project builds and distributes a modified version of OpenAI Codex based
+on tag rust-v0.146.0, commit e363b08c9175ac1cbe5893615dd2cb9ddf95043b.
+The modifications add the opt-in Codex Mini HUD and its supporting state and
+event plumbing. Modified files are represented by the patch under patches/.
+
+OpenAI Codex
+Copyright 2025 OpenAI
+
+OpenAI Codex includes code derived from Ratatui, licensed under the MIT license.
+Copyright (c) 2016-2022 Florian Dehau
+Copyright (c) 2023-2025 The Ratatui Developers

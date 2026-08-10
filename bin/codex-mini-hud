@@ -1,0 +1,469 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VERSION="$(cat "$ROOT_DIR/VERSION" 2>/dev/null || printf 'unknown')"
+CODEX_DIR="${CODEX_HOME:-$HOME/.codex}"
+CONFIG="${CODEX_HUD_CONFIG:-$CODEX_DIR/config.toml}"
+STATE_DIR="${CODEX_HUD_STATE_DIR:-$HOME/.codex-mini-hud}"
+
+[[ "$CONFIG" == /* ]] || {
+  printf 'codex-mini-hud: CODEX_HUD_CONFIG must be an absolute path\n' >&2
+  exit 1
+}
+[[ "$STATE_DIR" == /* ]] || {
+  printf 'codex-mini-hud: CODEX_HUD_STATE_DIR must be an absolute path\n' >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+Usage: codex-mini-hud <command> [options]
+
+Commands:
+  install          Install the native Codex footer preset
+  uninstall        Restore the previously managed footer settings
+  print-config     Print the preset TOML without changing anything
+  layout           Explain the cockpit's visual grammar
+  doctor           Show compatibility and installation status
+  version          Print the codex-mini-hud version
+
+Install options:
+  --minimal          Four-field instrument strip (`--compact` alias)
+  --focus            Work state, plan, branch, changes, and context
+  --fuel             Context, five-hour, weekly, and model
+  --expanded         Add weekly limit and plan progress
+  --with-git-branch  Add the current Git branch
+  --private-title    Keep thread text out of the terminal title
+  --no-color         Ask Codex not to color footer items
+  --dry-run          Show the proposed config diff without writing
+
+Uninstall options:
+  --dry-run          Show the proposed config diff without writing
+EOF
+}
+
+die() {
+  printf 'codex-mini-hud: %s\n' "$*" >&2
+  exit 1
+}
+
+check_platform() {
+  if [[ "${CODEX_HUD_TESTING:-0}" != "1" && "$(uname -s)" != "Darwin" ]]; then
+    die "v${VERSION} currently supports macOS only"
+  fi
+}
+
+check_paths() {
+  [[ ! -L "$CONFIG" ]] || die "refusing to edit symlink: $CONFIG"
+  [[ ! -L "$STATE_DIR" ]] || die "refusing to use symlink: $STATE_DIR"
+}
+
+make_blocks() {
+  local profile="$1" git_branch="$2" use_color="$3" private_title="$4"
+  BLOCK_FILE="$5/status-line.toml"
+  COLOR_FILE="$5/colors.toml"
+  TITLE_FILE="$5/terminal-title.toml"
+
+  {
+    printf 'status_line = [\n'
+    case "$profile" in
+      signal)
+        printf '  "run-state",\n'
+        printf '  "model-with-reasoning",\n'
+        printf '  "context-remaining",\n'
+        printf '  "five-hour-limit",\n'
+        [[ "$git_branch" == "1" ]] && printf '  "git-branch",\n'
+        printf '  "branch-changes",\n'
+        ;;
+      minimal)
+        printf '  "run-state",\n'
+        printf '  "context-remaining",\n'
+        printf '  "five-hour-limit",\n'
+        [[ "$git_branch" == "1" ]] && printf '  "git-branch",\n'
+        printf '  "branch-changes",\n'
+        ;;
+      focus)
+        printf '  "run-state",\n'
+        printf '  "task-progress",\n'
+        printf '  "git-branch",\n'
+        printf '  "branch-changes",\n'
+        printf '  "context-remaining",\n'
+        ;;
+      fuel)
+        printf '  "context-remaining",\n'
+        printf '  "five-hour-limit",\n'
+        printf '  "weekly-limit",\n'
+        [[ "$git_branch" == "1" ]] && printf '  "git-branch",\n'
+        printf '  "model-with-reasoning",\n'
+        ;;
+      expanded)
+        printf '  "run-state",\n'
+        printf '  "model-with-reasoning",\n'
+        printf '  "context-remaining",\n'
+        printf '  "five-hour-limit",\n'
+        printf '  "weekly-limit",\n'
+        printf '  "task-progress",\n'
+        [[ "$git_branch" == "1" ]] && printf '  "git-branch",\n'
+        printf '  "branch-changes",\n'
+        ;;
+    esac
+    printf ']\n'
+  } > "$BLOCK_FILE"
+  printf 'status_line_use_colors = %s\n' "$use_color" > "$COLOR_FILE"
+  {
+    printf 'terminal_title = [\n'
+    printf '  "activity",\n'
+    printf '  "project-name",\n'
+    [[ "$private_title" == "0" ]] && printf '  "thread-title",\n'
+    printf ']\n'
+  } > "$TITLE_FILE"
+}
+
+extract_managed() {
+  local source="$1" status_out="$2" color_out="$3" title_out="$4"
+  : > "$status_out"
+  : > "$color_out"
+  : > "$title_out"
+  [[ -f "$source" ]] || return 0
+  awk -v status_out="$status_out" -v color_out="$color_out" -v title_out="$title_out" \
+    -f "$ROOT_DIR/lib/extract.awk" "$source"
+}
+
+patch_config() {
+  local action="$1" source="$2" output="$3" status_block="$4" color_block="$5" title_block="$6"
+  if [[ -f "$source" ]]; then
+    awk -v action="$action" -v block_file="$status_block" -v color_file="$color_block" -v title_file="$title_block" \
+      -f "$ROOT_DIR/lib/config.awk" "$source" > "$output"
+  else
+    awk -v action="$action" -v block_file="$status_block" -v color_file="$color_block" -v title_file="$title_block" \
+      -f "$ROOT_DIR/lib/config.awk" /dev/null > "$output"
+  fi
+}
+
+show_diff() {
+  local before="$1" after="$2"
+  if [[ -f "$before" ]]; then
+    diff -u "$before" "$after" || true
+  else
+    diff -u /dev/null "$after" || true
+  fi
+}
+
+atomic_replace() {
+  local prepared="$1" target="$2" dir tmp
+  dir="$(dirname "$target")"
+  mkdir -p "$dir" || return 1
+  tmp="$(mktemp "$dir/.codex-mini-hud.XXXXXX")" || return 1
+  if [[ "${CODEX_HUD_TEST_FAIL_REPLACE:-0}" == "1" ]]; then
+    rm -f "$tmp"
+    return 1
+  fi
+  cp "$prepared" "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
+cleanup_state() {
+  local file
+  for file in \
+    manifest config-path version config-existed \
+    previous-status-line.toml previous-colors.toml previous-terminal-title.toml \
+    installed-status-line.toml installed-colors.toml installed-terminal-title.toml; do
+    rm -f "$STATE_DIR/$file" || return 1
+  done
+  rmdir "$STATE_DIR" 2>/dev/null
+}
+
+source_unchanged() {
+  local snapshot="$1" existed="$2"
+  if [[ "$existed" == "yes" ]]; then
+    [[ -f "$CONFIG" ]] && cmp -s "$snapshot" "$CONFIG"
+  else
+    [[ ! -e "$CONFIG" ]]
+  fi
+}
+
+install_hud() {
+  local profile=signal preset_count=0 git_branch=0 use_color=true private_title=0 dry_run=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --compact|--minimal) profile=minimal; preset_count=$((preset_count + 1)) ;;
+      --focus) profile=focus; preset_count=$((preset_count + 1)) ;;
+      --fuel) profile=fuel; preset_count=$((preset_count + 1)) ;;
+      --expanded) profile=expanded; preset_count=$((preset_count + 1)) ;;
+      --with-git-branch) git_branch=1 ;;
+      --private-title) private_title=1 ;;
+      --no-color) use_color=false ;;
+      --dry-run) dry_run=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown install option: $arg" ;;
+    esac
+  done
+  (( preset_count <= 1 )) || die "choose only one layout preset"
+
+  check_platform
+  check_paths
+  if [[ "${CODEX_HUD_TESTING:-0}" != "1" ]]; then
+    command -v codex >/dev/null 2>&1 || die "Codex CLI is not installed"
+  fi
+
+  local work proposed state_tmp config_existed snapshot
+  work="$(mktemp -d "${TMPDIR:-/tmp}/codex-mini-hud.XXXXXX")"
+  trap 'rm -rf "${work:-}" "${state_tmp:-}"' RETURN
+  make_blocks "$profile" "$git_branch" "$use_color" "$private_title" "$work"
+  snapshot="$work/original-config.toml"
+  if [[ -f "$CONFIG" ]]; then
+    cp "$CONFIG" "$snapshot"
+    config_existed=yes
+  else
+    : > "$snapshot"
+    config_existed=no
+  fi
+  proposed="$work/config.toml"
+  patch_config install "$CONFIG" "$proposed" "$BLOCK_FILE" "$COLOR_FILE" "$TITLE_FILE"
+
+  if (( dry_run )); then
+    show_diff "$CONFIG" "$proposed"
+    trap - RETURN
+    rm -rf "$work"
+    return 0
+  fi
+
+  if [[ -d "$STATE_DIR" ]]; then
+    local current_status="$work/current-status.toml" current_color="$work/current-colors.toml" current_title="$work/current-title.toml"
+    if [[ "$(cat "$STATE_DIR/manifest" 2>/dev/null || true)" == "codex-mini-hud-state-v1" ]]; then
+      die "legacy installation detected; run ./uninstall.sh before installing v${VERSION}"
+    fi
+    extract_managed "$CONFIG" "$current_status" "$current_color" "$current_title"
+    if [[ "$(cat "$STATE_DIR/manifest" 2>/dev/null || true)" == "codex-mini-hud-state-v2" ]] && \
+       [[ -f "$STATE_DIR/installed-status-line.toml" ]] && \
+       cmp -s "$current_status" "$STATE_DIR/installed-status-line.toml" && \
+       cmp -s "$current_color" "$STATE_DIR/installed-colors.toml" && \
+       cmp -s "$current_title" "$STATE_DIR/installed-terminal-title.toml"; then
+      if cmp -s "$BLOCK_FILE" "$STATE_DIR/installed-status-line.toml" && \
+         cmp -s "$COLOR_FILE" "$STATE_DIR/installed-colors.toml" && \
+         cmp -s "$TITLE_FILE" "$STATE_DIR/installed-terminal-title.toml"; then
+        printf 'codex-mini-hud is already installed.\n'
+        trap - RETURN
+        rm -rf "$work"
+        return 0
+      fi
+      die "already installed with a different preset; uninstall before changing options"
+    elif [[ "$(cat "$STATE_DIR/manifest" 2>/dev/null || true)" == "codex-mini-hud-state-v2" ]] && \
+         cmp -s "$current_status" "$STATE_DIR/previous-status-line.toml" && \
+         cmp -s "$current_color" "$STATE_DIR/previous-colors.toml" && \
+         cmp -s "$current_title" "$STATE_DIR/previous-terminal-title.toml"; then
+      cleanup_state || die "incomplete prior install has unexpected state files at $STATE_DIR"
+    else
+      die "installation state already exists at $STATE_DIR; uninstall or inspect it first"
+    fi
+  fi
+
+  mkdir -p "$(dirname "$STATE_DIR")"
+  state_tmp="$(mktemp -d "$(dirname "$STATE_DIR")/.codex-mini-hud.XXXXXX")"
+  extract_managed "$CONFIG" "$state_tmp/previous-status-line.toml" "$state_tmp/previous-colors.toml" "$state_tmp/previous-terminal-title.toml"
+  cp "$BLOCK_FILE" "$state_tmp/installed-status-line.toml"
+  cp "$COLOR_FILE" "$state_tmp/installed-colors.toml"
+  cp "$TITLE_FILE" "$state_tmp/installed-terminal-title.toml"
+  printf 'codex-mini-hud-state-v2\n' > "$state_tmp/manifest"
+  printf '%s\n' "$CONFIG" > "$state_tmp/config-path"
+  printf '%s\n' "$VERSION" > "$state_tmp/version"
+  printf '%s\n' "$config_existed" > "$state_tmp/config-existed"
+  chmod 700 "$state_tmp"
+  chmod 600 "$state_tmp"/*
+
+  mv "$state_tmp" "$STATE_DIR"
+  state_tmp=""
+  if ! source_unchanged "$snapshot" "$config_existed"; then
+    cleanup_state || true
+    die "$CONFIG changed during installation; no changes were written"
+  fi
+  if ! atomic_replace "$proposed" "$CONFIG"; then
+    cleanup_state || true
+    die "could not update $CONFIG"
+  fi
+
+  printf 'Installed codex-mini-hud v%s.\n' "$VERSION"
+  printf '  Updated %s\n' "$CONFIG"
+  printf '  Restart Codex or start a new session to see the footer.\n'
+  trap - RETURN
+  rm -rf "$work"
+}
+
+uninstall_hud() {
+  local dry_run=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --dry-run) dry_run=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown uninstall option: $arg" ;;
+    esac
+  done
+
+  check_platform
+  check_paths
+  [[ -d "$STATE_DIR" ]] || die "no installation state found at $STATE_DIR"
+  local state_schema
+  state_schema="$(cat "$STATE_DIR/manifest" 2>/dev/null || true)"
+  [[ "$state_schema" == "codex-mini-hud-state-v1" || "$state_schema" == "codex-mini-hud-state-v2" ]] || die "unrecognized installation state"
+  [[ -f "$STATE_DIR/config-path" ]] || die "installation state is incomplete"
+
+  local installed_config
+  installed_config="$(cat "$STATE_DIR/config-path")"
+  [[ "$installed_config" == "$CONFIG" ]] || die "installation belongs to $installed_config, not $CONFIG"
+  if [[ ! -f "$CONFIG" ]]; then
+    if [[ "$(cat "$STATE_DIR/config-existed")" == "no" ]] && \
+       [[ ! -s "$STATE_DIR/previous-status-line.toml" ]] && \
+       [[ ! -s "$STATE_DIR/previous-colors.toml" ]] && \
+       { [[ "$state_schema" == "codex-mini-hud-state-v1" ]] || [[ ! -s "$STATE_DIR/previous-terminal-title.toml" ]]; }; then
+      if ! cleanup_state; then
+        printf 'codex-mini-hud: uninstall was already complete; preserved unexpected files in %s\n' "$STATE_DIR" >&2
+      else
+        printf 'Completed cleanup from an interrupted uninstall.\n'
+      fi
+      return 0
+    fi
+    die "configured file no longer exists: $CONFIG"
+  fi
+
+  local work current_status current_color current_title proposed snapshot
+  work="$(mktemp -d "${TMPDIR:-/tmp}/codex-mini-hud.XXXXXX")"
+  trap 'rm -rf "${work:-}"' RETURN
+  current_status="$work/current-status.toml"
+  current_color="$work/current-colors.toml"
+  current_title="$work/current-title.toml"
+  snapshot="$work/original-config.toml"
+  cp "$CONFIG" "$snapshot"
+  extract_managed "$CONFIG" "$current_status" "$current_color" "$current_title"
+
+  local installed_matches=0 previous_matches=0 restore_title
+  if cmp -s "$current_status" "$STATE_DIR/installed-status-line.toml" && \
+     cmp -s "$current_color" "$STATE_DIR/installed-colors.toml" && \
+     { [[ "$state_schema" == "codex-mini-hud-state-v1" ]] || cmp -s "$current_title" "$STATE_DIR/installed-terminal-title.toml"; }; then
+    installed_matches=1
+  fi
+  if cmp -s "$current_status" "$STATE_DIR/previous-status-line.toml" && \
+     cmp -s "$current_color" "$STATE_DIR/previous-colors.toml" && \
+     { [[ "$state_schema" == "codex-mini-hud-state-v1" ]] || cmp -s "$current_title" "$STATE_DIR/previous-terminal-title.toml"; }; then
+    previous_matches=1
+  fi
+
+  if (( installed_matches == 0 )); then
+    if (( previous_matches == 1 )); then
+      if ! cleanup_state; then
+        printf 'codex-mini-hud: uninstall was already complete; preserved unexpected files in %s\n' "$STATE_DIR" >&2
+      else
+        printf 'Completed cleanup from an interrupted uninstall.\n'
+      fi
+      trap - RETURN
+      rm -rf "$work"
+      return 0
+    fi
+    die "managed footer settings changed after install; refusing to overwrite them"
+  fi
+
+  proposed="$work/config.toml"
+  if [[ "$state_schema" == "codex-mini-hud-state-v1" ]]; then
+    restore_title="$current_title"
+  else
+    restore_title="$STATE_DIR/previous-terminal-title.toml"
+  fi
+  patch_config restore "$CONFIG" "$proposed" \
+    "$STATE_DIR/previous-status-line.toml" "$STATE_DIR/previous-colors.toml" "$restore_title"
+
+  if (( dry_run )); then
+    show_diff "$CONFIG" "$proposed"
+    trap - RETURN
+    rm -rf "$work"
+    return 0
+  fi
+
+  cmp -s "$snapshot" "$CONFIG" || die "$CONFIG changed during uninstall; no changes were written"
+  if [[ "$(cat "$STATE_DIR/config-existed")" == "no" ]] && \
+     awk 'BEGIN { n=0 } /^[[:space:]]*$/ { next } /^[[:space:]]*\[tui\][[:space:]]*$/ { next } { n++ } END { exit(n != 0) }' "$proposed"; then
+    rm -f "$CONFIG"
+  else
+    atomic_replace "$proposed" "$CONFIG" || die "could not update $CONFIG"
+  fi
+  if ! cleanup_state; then
+    printf 'codex-mini-hud: restored config, but preserved unexpected files in %s\n' "$STATE_DIR" >&2
+  fi
+  printf 'Uninstalled codex-mini-hud and restored its managed settings.\n'
+  trap - RETURN
+  rm -rf "$work"
+}
+
+print_config() {
+  local profile=signal preset_count=0 git_branch=0 use_color=true private_title=0 arg work
+  for arg in "$@"; do
+    case "$arg" in
+      --compact|--minimal) profile=minimal; preset_count=$((preset_count + 1)) ;;
+      --focus) profile=focus; preset_count=$((preset_count + 1)) ;;
+      --fuel) profile=fuel; preset_count=$((preset_count + 1)) ;;
+      --expanded) profile=expanded; preset_count=$((preset_count + 1)) ;;
+      --with-git-branch) git_branch=1 ;;
+      --private-title) private_title=1 ;;
+      --no-color) use_color=false ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown print-config option: $arg" ;;
+    esac
+  done
+  (( preset_count <= 1 )) || die "choose only one layout preset"
+  work="$(mktemp -d "${TMPDIR:-/tmp}/codex-mini-hud.XXXXXX")"
+  trap 'rm -rf "$work"' RETURN
+  make_blocks "$profile" "$git_branch" "$use_color" "$private_title" "$work"
+  printf '[tui]\n'
+  cat "$BLOCK_FILE" "$COLOR_FILE" "$TITLE_FILE"
+  trap - RETURN
+  rm -rf "$work"
+}
+
+layout() {
+  cat <<'EOF'
+codex-mini-hud cockpit
+
+  FOOTER   NOW · ENGINE · FUEL · LIMIT · DELTA
+           state  model    context  5h      +/-
+
+  TITLE    activity · project · thread
+
+For a short Unicode task tag inside Codex, rename the thread:
+  /rename ✦ auth cleanup
+
+Profiles: --minimal | --focus | --fuel | --expanded
+EOF
+}
+
+doctor() {
+  check_platform
+  printf 'codex-mini-hud: %s\n' "$VERSION"
+  if command -v codex >/dev/null 2>&1; then
+    printf 'codex:          %s\n' "$(codex --version 2>/dev/null || printf 'installed')"
+  else
+    printf 'codex:          not found\n'
+  fi
+  printf 'config:         %s%s\n' "$CONFIG" "$([[ -f "$CONFIG" ]] && printf ' (found)' || printf ' (missing)')"
+  printf 'installation:   %s\n' "$([[ -d "$STATE_DIR" ]] && printf 'managed' || printf 'not managed')"
+  if [[ -L "$CONFIG" || -L "$STATE_DIR" ]]; then
+    printf 'safety:         symlink detected; install/uninstall will refuse\n'
+  else
+    printf 'safety:         paths are not symlinks\n'
+  fi
+}
+
+command_name="${1:-help}"
+[[ $# -gt 0 ]] && shift
+case "$command_name" in
+  install) install_hud "$@" ;;
+  uninstall) uninstall_hud "$@" ;;
+  print-config) print_config "$@" ;;
+  layout) layout ;;
+  doctor) doctor "$@" ;;
+  version|--version|-V) printf '%s\n' "$VERSION" ;;
+  help|-h|--help) usage ;;
+  *) die "unknown command: $command_name" ;;
+esac

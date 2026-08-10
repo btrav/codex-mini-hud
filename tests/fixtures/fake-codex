@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+printf 'codex-hud-test 0.0.0\n'

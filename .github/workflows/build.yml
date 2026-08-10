@@ -1,0 +1,95 @@
+name: build-codex-hud
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  patch-test:
+    runs-on: macos-15-xlarge
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          components: rustfmt, clippy
+      - name: Check patch and HUD tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          source upstream.lock
+          git clone --filter=blob:none --no-checkout https://github.com/openai/codex.git upstream
+          git -C upstream fetch --depth 1 origin "$CODEX_COMMIT"
+          git -C upstream checkout --detach "$CODEX_COMMIT"
+          git -C upstream apply --check "$GITHUB_WORKSPACE/patches/0001-codex-mini-hud.patch"
+          git -C upstream apply "$GITHUB_WORKSPACE/patches/0001-codex-mini-hud.patch"
+          cd upstream/codex-rs
+          cargo fmt --all -- --check
+          cargo test -p codex-tui mini_hud --lib
+      - name: Test installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./test.sh
+          ./test-package.sh
+
+  package:
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    needs: patch-test
+    runs-on: macos-15-xlarge
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="v$(<VERSION)"
+          [[ "$GITHUB_REF_NAME" == "$expected" ]] || {
+            printf 'Release tag %s must match VERSION (%s)\n' "$GITHUB_REF_NAME" "$expected" >&2
+            exit 1
+          }
+      - name: Build canonical package
+        env:
+          CODEX_HUD_TARGET: ${{ matrix.target }}
+        run: ./scripts/build.sh
+      - name: Verify canonical package
+        shell: bash
+        env:
+          CODEX_HUD_TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          archive="$(find dist -maxdepth 1 -type f -name "*-${CODEX_HUD_TARGET}.tar.gz" -print -quit)"
+          [[ -n "$archive" ]]
+          ./scripts/verify-package.sh "$archive" "$CODEX_HUD_TARGET"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: codex-hud-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error

@@ -1,0 +1,28 @@
+.DS_Store
+dist/
+target/
+build/
+upstream/
+*.log
+
+# Local credentials and signing material must never enter source control.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.mobileprovision
+*.cer
+*.provisionprofile
+
+# Local Codex data can contain authentication and session information.
+.codex/
+auth.json
+sessions/
+
+# Editors and local tooling.
+.idea/
+.vscode/
+*.swp
+*~

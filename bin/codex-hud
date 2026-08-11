@@ -7,9 +7,27 @@ PACKAGE_ROOT="${CODEX_HUD_PACKAGE_ROOT:-$HOME/.local/share/codex-mini-hud/curren
 CODEX_BIN="$PACKAGE_ROOT/bin/codex"
 STATE_DIR="${CODEX_HUD_ACTIVITY_DIR:-$HOME/.local/state/codex-mini-hud}"
 
+if [[ "${1:-}" == "--hud-doctor" ]]; then
+  printf 'Codex Mini HUD launcher: %s\n' "$0"
+  printf 'Package root:            %s\n' "$PACKAGE_ROOT"
+  printf 'Activity state:          %s\n' "$STATE_DIR"
+  if [[ -x "$CODEX_BIN" ]]; then
+    printf 'Patched Codex:           %s\n' "$("$CODEX_BIN" --version 2>/dev/null || printf 'version unavailable')"
+    if [[ -r "$PACKAGE_ROOT/codex-package.json" ]]; then
+      printf 'Package target:          %s\n' \
+        "$(/usr/bin/plutil -extract target raw -o - "$PACKAGE_ROOT/codex-package.json" 2>/dev/null || printf 'unavailable')"
+    fi
+  else
+    printf 'Patched Codex:           missing\n'
+    printf 'Recovery: reinstall codex-mini-hud from its release archive.\n'
+  fi
+  exit 0
+fi
+
 [[ -x "$CODEX_BIN" ]] || {
   printf 'codex-hud: patched Codex package is missing: %s\n' "$CODEX_BIN" >&2
-  printf 'Run codex-mini-hud install first.\n' >&2
+  printf 'Reinstall codex-mini-hud from its release archive.\n' >&2
+  printf 'Run codex-hud --hud-doctor for installation details.\n' >&2
   exit 1
 }
 

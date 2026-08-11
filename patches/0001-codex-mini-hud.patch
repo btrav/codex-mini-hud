@@ -172,7 +172,8 @@ new file mode 100644
 index 0000000000..485aaad290
 --- /dev/null
 +++ b/codex-rs/tui/src/chatwidget/mini_hud.rs
-@@ -0,0 +1,743 @@
+@@ -0,0 +1,795 @@
++use super::status_surfaces::five_hour_status_window;
 +use super::*;
 +use codex_protocol::config_types::ServiceTier;
 +use ratatui::prelude::Stylize;
@@ -309,7 +310,7 @@ index 0000000000..485aaad290
 +            ));
 +        }
 +
-+        match self.status_line_context_used_percent() {
++        match self.mini_hud_context_used_percent() {
 +            Some(used) if minimal => fields.push(HudField::attached(
 +                format!("{used}%"),
 +                threshold_tone(used),
@@ -322,12 +323,14 @@ index 0000000000..485aaad290
 +            None => fields.push(HudField::attached("ctx ?", Tone::Muted, 0)),
 +        }
 +
-+        if let Some(window) = self
++        if let Some((window, _)) = self
 +            .rate_limit_snapshots_by_limit_id
 +            .get("codex")
-+            .and_then(|snapshot| snapshot.primary.as_ref())
++            .and_then(five_hour_status_window)
 +        {
-+            let remaining = (100.0 - window.used_percent).clamp(0.0, 100.0).round() as i64;
++            let remaining = (100.0f64 - window.used_percent)
++                .clamp(0.0f64, 100.0f64)
++                .round() as i64;
 +            let reset = (remaining <= 24)
 +                .then(|| window.resets_at_epoch.and_then(reset_eta))
 +                .flatten();
@@ -415,6 +418,15 @@ index 0000000000..485aaad290
 +        render_fields(fields, use_colors)
 +    }
 +
++    fn mini_hud_context_used_percent(&self) -> Option<i64> {
++        // The built-in status line treats missing data as a full remaining
++        // context window. That is sensible for its "Context N% left" field,
++        // but the HUD must distinguish unknown from a measured 0% used.
++        self.status_line_context_window_size()?;
++        self.token_info.as_ref()?;
++        self.status_line_context_used_percent()
++    }
++
 +    fn schedule_mini_hud_tick(&self) {
 +        if self.mini_hud_tick_scheduled.replace(true) {
 +            return;
@@ -472,12 +484,10 @@ index 0000000000..485aaad290
 +    }
 +
 +    pub(super) fn mini_hud_finish_turn(&mut self) {
-+        self.mini_hud_lines_added = self
-+            .mini_hud_lines_added
-+            .saturating_add(self.mini_hud_pending_diff.0);
-+        self.mini_hud_lines_removed = self
-+            .mini_hud_lines_removed
-+            .saturating_add(self.mini_hud_pending_diff.1);
++        (self.mini_hud_lines_added, self.mini_hud_lines_removed) = accumulate_turn_diff(
++            (self.mini_hud_lines_added, self.mini_hud_lines_removed),
++            self.mini_hud_pending_diff,
++        );
 +        self.mini_hud_pending_diff = (0, 0);
 +        self.refresh_status_line();
 +    }
@@ -552,7 +562,7 @@ index 0000000000..485aaad290
 +                matches!(segment.tone, Tone::Danger) && segment.text.starts_with('!')
 +            })
 +        })
-+        .map(|field| field.text())
++        .map(HudField::text)
 +        .collect::<Vec<_>>();
 +    let context = fields
 +        .iter()
@@ -782,6 +792,13 @@ index 0000000000..485aaad290
 +    })
 +}
 +
++fn accumulate_turn_diff(total: (u64, u64), pending: (u64, u64)) -> (u64, u64) {
++    (
++        total.0.saturating_add(pending.0),
++        total.1.saturating_add(pending.1),
++    )
++}
++
 +fn mini_hud_full_access(config: &Config) -> bool {
 +    config.permissions.effective_permission_profile() == PermissionProfile::Disabled
 +}
@@ -813,6 +830,41 @@ index 0000000000..485aaad290
 +            diff_line_counts("--- a/file\n+++ b/file\n@@ -1 +1,2 @@\n-old\n+new\n+more\n"),
 +            (2, 1)
 +        );
++    }
++
++    #[test]
++    fn final_cumulative_diff_is_counted_once_per_turn() {
++        let first_snapshot = diff_line_counts("+one\n-old\n");
++        let final_snapshot = diff_line_counts("+one\n+two\n-old\n");
++        assert_eq!(first_snapshot, (1, 1));
++        assert_eq!(final_snapshot, (2, 1));
++        assert_eq!(accumulate_turn_diff((0, 0), final_snapshot), (2, 1));
++    }
++
++    #[test]
++    fn short_window_is_selected_when_weekly_window_is_primary() {
++        let snapshot = RateLimitSnapshotDisplay {
++            limit_name: "codex".to_string(),
++            captured_at: Local::now(),
++            primary: Some(RateLimitWindowDisplay {
++                used_percent: 80.0,
++                resets_at: None,
++                resets_at_epoch: None,
++                window_minutes: Some(10_080),
++            }),
++            secondary: Some(RateLimitWindowDisplay {
++                used_percent: 20.0,
++                resets_at: None,
++                resets_at_epoch: None,
++                window_minutes: Some(300),
++            }),
++            credits: None,
++            individual_limit: None,
++        };
++
++        let (window, is_secondary) = five_hour_status_window(&snapshot).unwrap();
++        assert!(is_secondary);
++        assert_eq!(window.used_percent, 20.0);
 +    }
 +
 +    #[test]
@@ -924,7 +976,7 @@ index 79e2c3fe6e..40f00a43e9 100644
          // this TUI already rendered locally. Once that turn ends, another
          // client can submit the same text and it still needs its own user cell.
          self.last_rendered_user_message_display = None;
-+        if !matches!(notification.turn.status, TurnStatus::InProgress) {
++        if self.mini_hud_enabled && !matches!(notification.turn.status, TurnStatus::InProgress) {
 +            self.mini_hud_finish_turn();
 +        }
          match notification.turn.status {
@@ -934,12 +986,16 @@ diff --git a/codex-rs/tui/src/chatwidget/protocol_requests.rs b/codex-rs/tui/src
 index c60c368fdb..2e0abecb30 100644
 --- a/codex-rs/tui/src/chatwidget/protocol_requests.rs
 +++ b/codex-rs/tui/src/chatwidget/protocol_requests.rs
-@@ -161,7 +161,7 @@ impl ChatWidget {
+@@ -161,7 +161,11 @@ impl ChatWidget {
  
      pub(super) fn on_turn_diff(&mut self, unified_diff: String) {
          debug!("TurnDiffEvent: {unified_diff}");
 -        self.refresh_status_line();
-+        self.mini_hud_update_turn_diff(&unified_diff);
++        if self.mini_hud_enabled {
++            self.mini_hud_update_turn_diff(&unified_diff);
++        } else {
++            self.refresh_status_line();
++        }
      }
  
      pub(super) fn on_deprecation_notice(&mut self, summary: String, details: Option<String>) {

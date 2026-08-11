@@ -187,6 +187,24 @@ validate_package() {
   [[ "$(manifest_value "$manifest" entrypoint)" == "bin/codex" ]] || die "package entrypoint is not bin/codex"
 }
 
+prune_retired_releases() {
+  local version_dir candidate
+  [[ -d "$SHARE_ROOT/releases" && ! -L "$SHARE_ROOT/releases" ]] || return 0
+  for version_dir in "$SHARE_ROOT/releases"/*; do
+    [[ -d "$version_dir" && ! -L "$version_dir" ]] || continue
+    for candidate in "$version_dir"/*; do
+      [[ -d "$candidate" && ! -L "$candidate" ]] || continue
+      [[ "$candidate" != "$release" ]] || continue
+      check_safe_path "$candidate" || continue
+      [[ "$(sed -n '1p' "$candidate/.codex-mini-hud-release" 2>/dev/null || true)" == "codex-mini-hud-release-v1" ]] \
+        || continue
+      rm -rf "$candidate"
+      printf 'Pruned retired release: %s\n' "$candidate"
+    done
+    rmdir "$version_dir" 2>/dev/null || true
+  done
+}
+
 if [[ -n "$ARCHIVE" ]]; then
   if [[ "$ARCHIVE" != /* ]]; then
     archive_candidate="$PWD/$ARCHIVE"
@@ -291,6 +309,11 @@ chmod 755 "$launcher_tmp"
 mv -f -h "$launcher_tmp" "$launcher"
 launcher_tmp=""
 committed=1
+
+# The installed package is a complete Codex distribution. Once the new package
+# and launcher have both been promoted, owned older releases are no longer
+# needed and would otherwise accumulate hundreds of megabytes per upgrade.
+prune_retired_releases
 
 rmdir "$lock"
 lock_acquired=0

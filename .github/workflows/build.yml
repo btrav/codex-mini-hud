@@ -6,7 +6,13 @@ on:
       - main
     tags:
       - "v*"
+    paths-ignore:
+      - "**.md"
   pull_request:
+    paths-ignore:
+      - "**.md"
+  schedule:
+    - cron: "23 14 * * 1"
   workflow_dispatch:
 
 permissions:
@@ -14,6 +20,7 @@ permissions:
 
 jobs:
   patch-test:
+    if: github.event_name != 'schedule'
     runs-on: macos-15-xlarge
     timeout-minutes: 60
     steps:
@@ -24,6 +31,15 @@ jobs:
         with:
           toolchain: 1.95.0
           components: rustfmt, clippy
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/codex-rs/target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-patch-${{ hashFiles('upstream.lock', 'patches/0001-codex-mini-hud.patch') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-patch-
       - name: Check patch and HUD tests
         shell: bash
         run: |
@@ -36,6 +52,7 @@ jobs:
           git -C upstream apply "$GITHUB_WORKSPACE/patches/0001-codex-mini-hud.patch"
           cd upstream/codex-rs
           cargo fmt --all -- --check
+          cargo clippy -p codex-tui --lib -- -D warnings
           cargo test -p codex-tui mini_hud --lib
       - name: Test installers
         shell: bash
@@ -63,6 +80,15 @@ jobs:
         with:
           toolchain: 1.95.0
           targets: ${{ matrix.target }}
+      - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/codex-${{ matrix.target }}/codex/codex-rs/target
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-package-${{ matrix.target }}-${{ hashFiles('upstream.lock', 'patches/0001-codex-mini-hud.patch') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-rust-1.95.0-package-${{ matrix.target }}-
       - name: Validate release tag
         if: startsWith(github.ref, 'refs/tags/')
         shell: bash
@@ -76,6 +102,7 @@ jobs:
       - name: Build canonical package
         env:
           CODEX_HUD_TARGET: ${{ matrix.target }}
+          CODEX_HUD_BUILD_DIR: build/codex-${{ matrix.target }}
         run: ./scripts/build.sh
       - name: Verify canonical package
         shell: bash
@@ -93,3 +120,63 @@ jobs:
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: package
+    runs-on: macos-15-xlarge
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: codex-hud-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release assets and installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64) target=aarch64-apple-darwin ;;
+            x86_64) target=x86_64-apple-darwin ;;
+            *) printf 'Unsupported runner architecture\n' >&2; exit 1 ;;
+          esac
+          archive="$(find dist -maxdepth 1 -type f -name "*-${target}.tar.gz" -print -quit)"
+          [[ -n "$archive" ]]
+          ./scripts/verify-package.sh "$archive" "$target"
+          export CODEX_HUD_SHARE_ROOT="$RUNNER_TEMP/codex-mini-hud-release/share"
+          export CODEX_HUD_BIN_DIR="$RUNNER_TEMP/codex-mini-hud-release/bin"
+          export CODEX_HUD_ACTIVITY_DIR="$RUNNER_TEMP/codex-mini-hud-release/activity"
+          ./install.sh --archive "$archive"
+          "$CODEX_HUD_BIN_DIR/codex-hud" --hud-doctor
+          "$CODEX_HUD_BIN_DIR/codex-hud" --version
+          ./uninstall.sh
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.sha256 \
+              --title "Codex Mini HUD ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
+
+  upstream-drift:
+    if: github.event_name == 'schedule'
+    runs-on: macos-15-xlarge
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+      - name: Check latest upstream patch applicability
+        shell: bash
+        run: ./scripts/check-upstream.sh

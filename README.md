@@ -17,6 +17,29 @@
 release. It installs as a separate `codex-hud` command. Your official `codex`
 command remains untouched and available as an immediate fallback.
 
+## Quick start
+
+1. Clone this repository, then download the archive and adjacent `.sha256` file
+   for your Mac from [GitHub Releases](https://github.com/btrav/codex-mini-hud/releases).
+   Choose `aarch64-apple-darwin` for Apple Silicon or `x86_64-apple-darwin` for Intel.
+2. From the repository checkout, install the downloaded archive:
+
+   ```bash
+   ./install.sh --archive ~/Downloads/codex-mini-hud-<version>-<architecture>.tar.gz
+   ```
+
+3. Confirm the installed package, then start Codex with the HUD:
+
+   ```bash
+   ~/.local/bin/codex-hud --hud-doctor
+   ~/.local/bin/codex-hud
+   ```
+
+   Add `~/.local/bin` to your `PATH` if you want to run `codex-hud` directly.
+
+The installer validates the checksum, architecture, and canonical Codex package
+contents before switching the active package. It never replaces `codex`.
+
 ## What it shows
 
 - `✦Codex✦` — bright identity marker that stays visible on dark backgrounds
@@ -74,7 +97,7 @@ network access for pinned build dependencies.
 
 The first optimized build compiles the full canonical Codex package and can
 take substantial time and temporary disk space. Release users should generally
-prefer the target-specific archives produced by CI.
+prefer the target-specific archives published on GitHub Releases.
 
 ```bash
 ./scripts/build.sh
@@ -102,7 +125,7 @@ Install a locally built package directory:
 Or install a release archive with its adjacent `.sha256` file:
 
 ```bash
-./install.sh --archive dist/codex-mini-hud-1.0.0-codex-0.146.0-aarch64-apple-darwin.tar.gz
+./install.sh --archive dist/codex-mini-hud-1.1.0-codex-0.146.0-aarch64-apple-darwin.tar.gz
 ```
 
 The default locations are:
@@ -123,6 +146,7 @@ Inspect the official and patched versions and their paths:
 
 ```bash
 ./scripts/doctor.sh
+codex-hud --hud-doctor
 ```
 
 The installer validates checksums and canonical package contents, refuses
@@ -136,12 +160,31 @@ Uninstall only the patched command and its active release:
 ./uninstall.sh
 ```
 
-The earlier stock-native status-line preset remains available as a fallback:
+### Advanced fallback: stock Codex footer preset
+
+The earlier `--native` preset configures only Codex's built-in footer fields.
+It does not provide custom bars, runtime, streak, or compaction metrics. Use it
+only when a managed device cannot run the separate patched binary:
 
 ```bash
 ./install.sh --native
 ./uninstall.sh --native
 ```
+
+## Troubleshooting
+
+### macOS asks for “Codex MCP Credentials” in Keychain
+
+`codex-hud` is a separately built executable that uses the same MCP OAuth
+tokens as official Codex. macOS can therefore ask for permission when it first
+accesses the `Codex MCP Credentials` Keychain item. Confirm the launcher and
+package with `codex-hud --hud-doctor` before approving.
+
+Choose **Allow** for a cautious first run; **Always Allow** trusts the current
+HUD build for future access. Denying the request does not affect the HUD itself
+or your official Codex command, but authenticated MCP services may need to
+reauthenticate. Enter your Mac password only in the macOS system dialog—never
+in Codex, a terminal prompt, or a chat.
 
 ## Development and verification
 
@@ -175,6 +218,9 @@ just test -p codex-tui
   assume it is always literally five hours.
 - Account streak is nullable or unavailable for API-key-only providers. The
   launcher maintains a local day streak as a fallback.
+- Each upgrade removes previously installed, HUD-owned package releases after
+  the new package and launcher pass validation. This prevents full Codex
+  packages from accumulating on disk.
 
 ## Compatibility and support
 

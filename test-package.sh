@@ -64,6 +64,10 @@ use_home basic
 [[ -L "$CODEX_HUD_SHARE_ROOT/current" ]]
 [[ "$(readlink "$CODEX_HUD_SHARE_ROOT/current")" == "$CODEX_HUD_SHARE_ROOT/releases/$HUD_VERSION/$TARGET" ]]
 "$CODEX_HUD_BIN_DIR/codex-hud" --version | grep -Fq 'codex-hud-test 0.0.0'
+doctor_out="$("$CODEX_HUD_BIN_DIR/codex-hud" --hud-doctor)"
+[[ "$doctor_out" == *"Codex Mini HUD launcher:"* ]]
+[[ "$doctor_out" == *"Patched Codex:           codex-hud-test 0.0.0"* ]]
+[[ "$doctor_out" == *"Package target:          $TARGET"* ]]
 
 first_activity="$(cat "$CODEX_HUD_ACTIVITY_DIR/activity")"
 "$CODEX_HUD_BIN_DIR/codex-hud" --version >/dev/null
@@ -119,7 +123,7 @@ ln -s "$old_release" "$CODEX_HUD_SHARE_ROOT/current"
 "$ROOT/scripts/install-package.sh" --package-dir "$package" >/dev/null
 new_release="$CODEX_HUD_SHARE_ROOT/releases/$HUD_VERSION/$TARGET"
 [[ "$(readlink "$CODEX_HUD_SHARE_ROOT/current")" == "$new_release" ]]
-[[ -z "$(find "$old_release" -name '.current.*.tmp' -print -quit)" ]]
+[[ ! -e "$old_release" ]]
 
 # A failure after current promotion rolls back current and removes the newly
 # created release rather than leaving a half-installed transaction.
